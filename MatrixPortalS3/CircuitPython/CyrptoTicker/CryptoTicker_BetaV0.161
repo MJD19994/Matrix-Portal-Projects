@@ -1,0 +1,228 @@
+import gc  # Import garbage collector
+import time
+import board
+import displayio
+import terminalio
+import adafruit_requests
+import wifi
+import socketpool
+import ssl
+import rgbmatrix
+import framebufferio
+import os
+from adafruit_display_text import label
+from adafruit_display_shapes.line import Line
+
+# Release any previously configured displays
+displayio.release_displays()
+
+# Initialize the RGB Matrix
+matrix = rgbmatrix.RGBMatrix(
+    width=64, height=64, bit_depth=4,
+    rgb_pins=[
+        board.MTX_R1, board.MTX_G1, board.MTX_B1,
+        board.MTX_R2, board.MTX_G2, board.MTX_B2
+    ],
+    addr_pins=[
+        board.MTX_ADDRA, board.MTX_ADDRB, board.MTX_ADDRC,
+        board.MTX_ADDRD, board.MTX_ADDRE
+    ],
+    clock_pin=board.MTX_CLK,
+    latch_pin=board.MTX_LAT,
+    output_enable_pin=board.MTX_OE
+)
+display = framebufferio.FramebufferDisplay(matrix, auto_refresh=True)
+
+# Function to display a message on the screen
+def display_message(messages, y_positions):
+    display_group = displayio.Group()
+    for index, message in enumerate(messages):
+        message_label = label.Label(terminalio.FONT, text=message, color=0xFFFFFF, x=0, y=y_positions[index])
+        display_group.append(message_label)
+    display.root_group = display_group
+
+# Display "Connecting" message on the screen
+display_message(["Connecting"], [24])
+
+# Read WiFi credentials from settings.toml
+ssid = os.getenv("CIRCUITPY_WIFI_SSID")
+password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+
+# Scan for available WiFi networks
+print("Scanning for available WiFi networks...")
+networks = wifi.radio.start_scanning_networks()
+available_networks = [network.ssid for network in networks]
+wifi.radio.stop_scanning_networks()
+print("Available networks:", available_networks)
+
+# Set up WiFi connection
+print(f"Connecting to WiFi SSID: {ssid}")
+try:
+    wifi.radio.connect(ssid, password)
+    print("Connected to WiFi")
+    ip_address = wifi.radio.ipv4_address
+    print("IP address:", ip_address)
+    # Display IP address on the screen broken up into three lines
+    ip_parts = str(ip_address).split(".")
+    display_message(["IP", f"{ip_parts[0]}.{ip_parts[1]}", f"{ip_parts[2]}.{ip_parts[3]}"], [8, 24, 40])
+    time.sleep(5)  # Display IP address for 5 seconds
+except Exception as e:
+    print("Failed to connect to WiFi:", e)
+    display_message(["Failed to", "connect to WiFi"], [16, 32])
+    time.sleep(5)  # Display error message for 5 seconds
+
+# Display "Loading" message on the screen
+display_message(["Loading"], [24])
+
+# Set up the network and requests
+pool = socketpool.SocketPool(wifi.radio)
+requests = adafruit_requests.Session(pool, ssl.create_default_context())
+
+# API URL to fetch the crypto prices from Kraken
+API_URL = "https://api.kraken.com/0/public/Ticker"
+HISTORY_API_URL = "https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=60&since={start}"
+CRYPTO_SYMBOLS = {"BTC": "XXBTZUSD", "ETH": "XETHZUSD", "XRP": "XXRPZUSD"}
+
+# Function to format timestamps for Kraken
+def format_timestamp(ts):
+    return int(ts)  # Kraken API uses seconds
+
+# Function to fetch price history for a cryptocurrency
+def fetch_price_history(symbol):
+    end_timestamp = format_timestamp(time.time())
+    start_timestamp = format_timestamp(time.time() - (12 * 60 * 60))  # Fetch data for the past 12 hours to reduce data size
+
+    url = HISTORY_API_URL.format(symbol=symbol, start=start_timestamp)
+    
+    response = requests.get(url)
+    print(f"HTTP Response Status: {response.status_code}")
+    print(f"HTTP Response Headers: {response.headers}")
+    data = response.json()
+    print(f"Full API Response for {symbol}: {data}")  # Debug print
+
+    if data['error']:
+        print(f"Error fetching price history data for {symbol}: {data['error']}")
+        return []
+    
+    result = data['result'][symbol]
+    return [(entry[0], entry[4]) for entry in result]  # Use timestamp and closing price
+
+# Function to fetch the current prices
+def fetch_crypto_prices():
+    try:
+        print("Fetching data from API...")
+        url = f"{API_URL}?pair={','.join(CRYPTO_SYMBOLS.values())}"
+        response = requests.get(url)
+        print(f"HTTP Response Status: {response.status_code}")
+        print(f"HTTP Response Headers: {response.headers}")
+        print("Data fetched successfully")
+        data = response.json()
+        print(f"Full API Response for current prices: {data}")  # Debug print
+
+        if data['error']:
+            raise ValueError(f"Error fetching current prices: {data['error']}")
+
+        prices = {symbol: float(data['result'][CRYPTO_SYMBOLS[symbol]]['c'][0]) for symbol in CRYPTO_SYMBOLS}
+        
+        if not prices:
+            raise ValueError("No matching assets found in the response")
+
+        print(f"Fetched prices: {prices}")
+        return prices
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return None
+
+# Optimized function to draw the price history graph with filled area
+def draw_price_history_graph(prices, symbol):
+    if not prices:
+        print(f"No price history data for {symbol}")
+        return None
+
+    values = [float(price[1]) for price in prices]
+    try:
+        min_value = min(values)
+        max_value = max(values)
+        normalized_values = [(value - min_value) / (max_value - min_value) for value in values]
+    except ValueError:
+        print(f"Error: No values to plot for {symbol}")
+        return None
+
+    graph_group = displayio.Group()
+
+    # Batch draw filled graph using vertical lines
+    lines = []
+    for i, value in enumerate(normalized_values):
+        x_position = i
+        y_position = int(63 - (value * 32))  # Scale values for the display height
+        lines.append(Line(x_position, y_position, x_position, 63, color=0x00FF00))  # From the graph point to the bottom
+    
+    # Add all lines to the graph group at once
+    for line in lines:
+        graph_group.append(line)
+
+    return graph_group
+
+# Main loop
+while True:
+    try:
+        # Collect garbage to free up memory
+        gc.collect()
+        print(f"Free memory: {gc.mem_free()} bytes")
+
+        prices = fetch_crypto_prices()
+        print(f"Fetched prices: {prices}")
+        if prices:
+            for symbol, crypto in CRYPTO_SYMBOLS.items():
+                # Create new instances of labels for each update cycle
+                symbol_label = label.Label(terminalio.FONT, text=symbol, color=0xFFFFFF, x=0, y=8)
+                price_label = label.Label(terminalio.FONT, text=f"${prices[symbol]:.2f}", color=0xFFFFFF, x=0, y=24)
+
+                history = fetch_price_history(CRYPTO_SYMBOLS[symbol])
+                graph_group = draw_price_history_graph(history, symbol)
+                if graph_group:
+                    # Create a new group for synchronized display
+                    sync_group = displayio.Group()
+                    sync_group.append(symbol_label)
+                    sync_group.append(price_label)
+                    sync_group.append(graph_group)
+                    display.root_group = sync_group
+                    time.sleep(10)  # Display for 10 seconds
+                # Delete objects to free up memory
+                del symbol_label
+                del price_label
+                del graph_group
+                del sync_group
+                gc.collect()  # Collect garbage after each update
+        else:
+            # Display error message if prices are not fetched
+            symbol_label = label.Label(terminalio.FONT, text="Error", color=0xFFFFFF, x=0, y=8)
+            price_label = label.Label(terminalio.FONT, text="Error", color=0xFFFFFF, x=0, y=24)
+            error_group = displayio.Group()
+            error_group.append(symbol_label)
+            error_group.append(price_label)
+            display.root_group = error_group
+            print("Displayed error message")
+            # Delete objects to free up memory
+            del symbol_label
+            del price_label
+            del error_group
+            gc.collect()  # Collect garbage after displaying error
+
+        # Update the prices and graph simultaneously every 60 seconds
+        time.sleep(60)
+    except Exception as e:
+        print("Error in main loop:", e)
+        # Display error message if an exception occurs
+        symbol_label = label.Label(terminalio.FONT, text="Error", color=0xFFFFFF, x=0, y=8)
+        price_label = label.Label(terminalio.FONT, text="Error", color=0xFFFFFF, x=0, y=24)
+        error_group = displayio.Group()
+        error_group.append(symbol_label)
+        error_group.append(price_label)
+        display.root_group = error_group
+        time.sleep(60)
+        # Delete objects to free up memory
+        del symbol_label
+        del price_label
+        del error_group
+        gc.collect()  # Collect garbage after displaying error
