@@ -1,0 +1,317 @@
+import gc
+import time
+import board
+import displayio
+import terminalio
+import adafruit_requests
+import wifi
+import socketpool
+import ssl
+import rgbmatrix
+import framebufferio
+import os
+import rtc
+from adafruit_ntp import NTP
+from adafruit_display_text import label
+from adafruit_display_shapes.line import Line
+from adafruit_display_shapes.rect import Rect  # Required for our filled-graph drawing
+
+# ========= Global Configuration and Variables =========
+fetch_interval = 360         # Fetch new data every 6 minutes (360 seconds)
+DATA_RANGE_DAYS = 30         # Historical data range in days
+GRAPH_HEIGHT = 32            # Graph vertical scaling (32 pixels high)
+HIST_UPDATE_INTERVAL = 3600  # Only update historical data every hour (3600 seconds)
+
+# Global caches and states
+latest_prices = {}           # Holds current prices (and change) for each coin
+latest_history = {}          # Holds historical data per coin
+last_displayed_graphs = {}   # Cache for display groups per coin
+last_fetched_time = 0
+hist_last_updated = {}       # Records when historical data was last updated per coin
+
+# ========= Coin Configuration =========
+def load_tracked_coins():
+    """
+    Attempt to load a configuration file "coin_config.txt" that defines which coins to track.
+    Each non-blank, non-comment line should have two comma-separated values: SYMBOL, COIN_ID.
+    For example, a line might read: BTC, bitcoin
+    If the file cannot be read, a default dictionary is returned.
+    """
+    try:
+        with open("coin_config.txt", "r") as f:
+            lines = f.readlines()
+        coins = {}
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                parts = line.split(',')
+                if len(parts) == 2:
+                    symbol = parts[0].strip()
+                    coin_id = parts[1].strip()
+                    coins[symbol] = coin_id
+        if coins:
+            print("Loaded tracked coins:", coins)
+            return coins
+    except Exception as e:
+        print("Could not load coin_config.txt, using default coins. Error:", e)
+    return {"BTC": "bitcoin", "ETH": "ethereum", "XRP": "ripple"}
+
+CRYPTO_SYMBOLS = load_tracked_coins()
+
+# ========= Matrix Setup =========
+displayio.release_displays()
+matrix = rgbmatrix.RGBMatrix(
+    width=64,
+    height=64,
+    bit_depth=4,
+    rgb_pins=[
+        board.MTX_R1, board.MTX_G1, board.MTX_B1,
+        board.MTX_R2, board.MTX_G2, board.MTX_B2
+    ],
+    addr_pins=[
+        board.MTX_ADDRA, board.MTX_ADDRB, board.MTX_ADDRC,
+        board.MTX_ADDRD, board.MTX_ADDRE
+    ],
+    clock_pin=board.MTX_CLK,
+    latch_pin=board.MTX_LAT,
+    output_enable_pin=board.MTX_OE
+)
+display = framebufferio.FramebufferDisplay(matrix, auto_refresh=True)
+
+# ========= WiFi and Initial Display Setup =========
+ssid = os.getenv("CIRCUITPY_WIFI_SSID")
+password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+
+def display_message(messages, y_positions):
+    display_group = displayio.Group()
+    for index, message in enumerate(messages):
+        message_label = label.Label(terminalio.FONT, text=message, color=0xFFFFFF, x=0, y=y_positions[index])
+        display_group.append(message_label)
+    display.root_group = display_group
+
+display_message(["Connecting"], [24])
+print(f"System time at startup: {time.localtime()}")
+
+print("Scanning for available WiFi networks...")
+networks = wifi.radio.start_scanning_networks()
+available_networks = [network.ssid for network in networks]
+wifi.radio.stop_scanning_networks()
+print(f"Available networks: {available_networks}")
+
+print(f"Connecting to WiFi SSID: {ssid}")
+try:
+    wifi.radio.connect(ssid, password)
+    print("Connected to WiFi")
+    ip_address = wifi.radio.ipv4_address
+    print(f"IP address: {ip_address}")
+    ip_parts = str(ip_address).split(".")
+    display_message(["IP", f"{ip_parts[0]}.{ip_parts[1]}", f"{ip_parts[2]}.{ip_parts[3]}"], [8, 24, 40])
+    time.sleep(5)
+except Exception as e:
+    print(f"Failed to connect to WiFi: {e}")
+    display_message(["Failed to", "connect to WiFi"], [16, 32])
+    time.sleep(5)
+
+display_message(["Loading"], [24])
+
+# ========= Network Context & Time Synchronization =========
+pool = socketpool.SocketPool(wifi.radio)
+requests = adafruit_requests.Session(pool, ssl.create_default_context())
+
+def synchronize_time():
+    for attempt in range(3):
+        try:
+            print("Attempting to synchronize time via NTP...")
+            ntp = NTP(pool, server="time.google.com")
+            rtc.RTC().datetime = ntp.datetime
+            print(f"System time synchronized: {time.localtime()}")
+            return
+        except Exception as e:
+            msg = f"NTP sync attempt {attempt+1} failed: {e}"
+            print(msg)
+            time.sleep(5)
+    print("Failed to synchronize time after 3 attempts.")
+
+synchronize_time()
+
+# ========= Extra Helper Functions =========
+def log_error(error_str):
+    lt = time.localtime()
+    timestamp = f"{lt.tm_year}-{lt.tm_mon:02d}-{lt.tm_mday:02d} {lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}"
+    try:
+        with open("error_log.txt", "a") as logfile:
+            logfile.write(f"[{timestamp}] {error_str}\n")
+    except Exception as e:
+        print(f"File logging failed: {e}")
+
+def verify_internet_connectivity():
+    try:
+        response = requests.get("http://1.1.1.1", timeout=5)
+        if response.status_code == 200:
+            print("Internet connectivity verified.")
+            return True
+    except Exception as e:
+        log_error(f"Internet connectivity test failed: {e}")
+    return False
+
+def log_signal_strength():
+    try:
+        print(f"Connected to SSID: {wifi.radio.ap_info.ssid}")
+    except Exception as e:
+        log_error(f"Error logging connection details: {e}")
+
+def monitor_wifi_connection():
+    try:
+        if not wifi.radio.ipv4_address or not verify_internet_connectivity():
+            print("WiFi or internet access lost. Reconnecting...")
+            wifi.radio.connect(ssid, password)
+            print(f"Reconnected! IP address: {wifi.radio.ipv4_address}")
+        else:
+            print(f"WiFi is stable. IP: {wifi.radio.ipv4_address}")
+    except Exception as e:
+        log_error(f"Error during WiFi monitoring: {e}")
+
+# ========= Data Fetching Functions =========
+def set_history_range(days):
+    global DATA_RANGE_DAYS
+    DATA_RANGE_DAYS = days
+    print(f"Historical data range set to {DATA_RANGE_DAYS} days.")
+
+def fetch_price_history(symbol):
+    global hist_last_updated, latest_history
+    current_monotonic = time.monotonic()
+    if symbol in hist_last_updated and (current_monotonic - hist_last_updated[symbol] < HIST_UPDATE_INTERVAL):
+         print(f"Using cached historical data for {symbol}.")
+         return latest_history.get(symbol, [])
+    print(f"Fetching price history for {symbol} from CoinGecko...")
+    try:
+        coin_id = CRYPTO_SYMBOLS[symbol]
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={DATA_RANGE_DAYS}"
+        response = requests.get(url)
+        if response.status_code == 429:
+            print(f"Rate limited (HTTP 429) while fetching price history for {symbol}. Pausing before retrying...")
+            time.sleep(30)
+            return fetch_price_history(symbol)
+        if response.status_code != 200:
+            raise Exception(f"HTTP Error {response.status_code}")
+        data = response.json()
+        prices = data.get("prices", [])
+        print(f"Fetched {len(prices)} historical entries for {symbol}.")
+        history = [(int(entry[0] / 1000), entry[1]) for entry in prices]
+        hist_last_updated[symbol] = current_monotonic
+        return history
+    except Exception as e:
+        print(f"Error fetching price history for {symbol}: {e}")
+        return []
+
+def fetch_crypto_prices():
+    print("Fetching current crypto prices from CoinGecko...")
+    try:
+        ids = ",".join(CRYPTO_SYMBOLS.values())
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception(f"HTTP Error {response.status_code}")
+        data = response.json()
+        prices = {}
+        for symbol, coin_id in CRYPTO_SYMBOLS.items():
+            if coin_id in data:
+                price_val = float(data[coin_id]["usd"])
+                change_val = float(data[coin_id].get("usd_24h_change", 0))
+                prices[symbol] = {"price": price_val, "change": change_val}
+                print(f"Fetched price for {symbol}: ${price_val:.2f}, change: {change_val:+.2f}%")
+            else:
+                print(f"Skipping unknown coin: {coin_id}")
+        return prices
+    except Exception as e:
+        print(f"Error fetching current prices: {e}")
+        return {}
+
+# ========= Graph Drawing Functions =========
+def draw_price_history_graph(prices, symbol):
+    print(f"Drawing filled area graph for {symbol}...")
+    if not prices:
+        print(f"No price history data for {symbol}")
+        return None
+    try:
+        values = [float(price[1]) for price in prices]
+        min_val = min(values)
+        max_val = max(values)
+        if min_val == max_val:
+            normalized_values = [0.5] * len(values)
+        else:
+            normalized_values = [(v - min_val) / (max_val - min_val) for v in values]
+    except Exception as e:
+        print(f"Error processing data for {symbol}: {e}")
+        return None
+    n = len(normalized_values)
+    if n < 2:
+        return None
+    graph_group = displayio.Group()
+    for x in range(64):
+        t = (x / 63) * (n - 1)
+        i = int(t)
+        if i >= n - 1:
+            interp_val = normalized_values[-1]
+        else:
+            frac = t - i
+            interp_val = normalized_values[i] * (1 - frac) + normalized_values[i + 1] * frac
+        y = int(63 - (interp_val * GRAPH_HEIGHT))
+        height = 63 - y + 1
+        r = Rect(x, y, 1, height, fill=0x00FF00)
+        graph_group.append(r)
+    print(f"Filled area graph for {symbol} drawn successfully.")
+    return graph_group
+
+def update_display(symbol, current, history):
+    print(f"Updating display for {symbol}...")
+    if symbol in last_displayed_graphs:
+        previous_history = last_displayed_graphs[symbol]["history"]
+        if previous_history == history:
+            print(f"No changes in data for {symbol}. Updating display focus.")
+            display.root_group = last_displayed_graphs[symbol]["group"]
+            return
+    graph_group = draw_price_history_graph(history, symbol)
+    if not graph_group:
+        print(f"Skipping display update for {symbol} due to missing graph.")
+        return
+    price_val = current.get("price", 0)
+    change_val = current.get("change", 0)
+    symbol_label = label.Label(terminalio.FONT, text=symbol, color=0xFFFFFF, x=0, y=8)
+    change_x = 32  # Display percentage next to symbol at x=32
+    change_color = 0x00FF00 if change_val >= 0 else 0xFF0000
+    change_label = label.Label(terminalio.FONT, text=f"{change_val:+.1f}%", color=change_color, x=change_x, y=8)
+    price_label = label.Label(terminalio.FONT, text=f"${price_val:.2f}", color=0xFFFFFF, x=0, y=24)
+    display_group = displayio.Group()
+    display_group.append(symbol_label)
+    display_group.append(change_label)
+    display_group.append(price_label)
+    display_group.append(graph_group)
+    display.root_group = display_group
+    last_displayed_graphs[symbol] = {"group": display_group, "history": history}
+    print(f"Display updated for {symbol}.")
+
+# ========= Main Loop (Data Fetch & Display Update) =========
+while True:
+    try:
+        gc.collect()
+        print(f"Free memory: {gc.mem_free()} bytes")
+        monitor_wifi_connection()
+        log_signal_strength()
+        current_time = time.monotonic()
+        if current_time - last_fetched_time >= fetch_interval or not latest_prices:
+            print("Fetching new data...")
+            latest_prices = fetch_crypto_prices()
+            for sym in CRYPTO_SYMBOLS:
+                latest_history[sym] = fetch_price_history(sym)
+            last_fetched_time = current_time
+            print("Data fetch completed.")
+        for sym in CRYPTO_SYMBOLS:
+            print(f"Displaying {sym}...")
+            if sym in latest_prices and sym in latest_history:
+                update_display(sym, latest_prices[sym], latest_history[sym])
+                print(f"Finished displaying {sym}. Cycling to the next coin...")
+                time.sleep(30)  # Display each coin for 30 seconds.
+    except Exception as e:
+        print(f"Error in main loop: {e}")
+        time.sleep(5)
