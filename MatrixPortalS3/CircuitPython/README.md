@@ -1,1 +1,1 @@
-Here are all my projects programmed in CircuitPython
+Everything in this section is coded using CircuitPython9
