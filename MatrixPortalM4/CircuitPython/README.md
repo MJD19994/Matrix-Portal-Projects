@@ -1,1 +1,1 @@
-Everything here is coded using CiruitPython9
+Everything in this section is coded using CiruitPython9
