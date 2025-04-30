@@ -7,7 +7,7 @@ I have found that some matrix panels represent colors different so here are some
 1) Verify Wiring and Pin Configuration:
     Many color discrepancies (such as red and blue being reversed) are caused by minor differences in how the display is wired. Verify that each color pin (red, green, blue) is correctly connected. If a you find that the colors        are swapped, you can adjust the order in the rgb_pins array. For example, if red and blue are reversed, you might swap your board.MTX_R1 with board.MTX_B1 (and similarly for your second set) in the code
 
-2) Use this simple test routine that displays solid color blocks/stripes (Each for Red, Green, Blue, White). This way you can visually check if each channel is performing as expected:
+2) Use this simple CircuitPython (If you are using Arduino Protomatter this will not work) test routine that displays solid color blocks/stripes (Each for Red, Green, Blue, White). This way you can visually check if each channel is performing as expected:
 
 
     	def display_color_test():
